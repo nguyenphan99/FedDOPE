@@ -85,11 +85,6 @@ class DomainOperator(nn.Module):
 
 
 def synthesize_all_domains(domain_operator, f_batch, own_domain_id, num_domains):
-    """
-    Domain Completion: từ feature THẬT của 1 domain duy nhất, sinh virtual
-    feature cho TẤT CẢ domain còn lại - biến 1 client single-domain thành
-    client đã "thấy" mọi domain (chỉ ở mức feature, không cần ảnh thật).
-    """
     content = domain_operator.invert_batch(f_batch, own_domain_id)
     virtual = {}
     for d in range(num_domains):
@@ -100,11 +95,6 @@ def synthesize_all_domains(domain_operator, f_batch, own_domain_id, num_domains)
 
 
 def build_domain_proto_grid(global_protos, domain_label, num_classes, feat_dim, device):
-    """
-    domain_label: PHẢI là string giống hệt key trong global_protos (vd "amazon"),
-    KHÔNG PHẢI domain_id (int) - vì global_protos được build với key
-    (class_int, domain_label_string) từ _train_net gốc.
-    """
     grid = torch.zeros(num_classes, feat_dim, device=device)
     valid = torch.zeros(num_classes, dtype=torch.bool, device=device)
     for cls in range(num_classes):

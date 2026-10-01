@@ -1,15 +1,3 @@
-#  Original paper + Domain Completion via shared Domain Operator
-#  ============================================================
-#  OPTIMIZED VERSION — các thay đổi chính (đánh dấu # [OPT]):
-#   1. Loại bỏ toàn bộ vòng lặp Python per-sample cho InfoNCE (real + virtual)
-#      -> thay bằng 1 phép matmul vector hóa trên cả batch, dùng proto_tensor
-#      cache được build 1 lần/round thay vì rebuild dict mỗi batch/sample.
-#   2. copy.deepcopy(f.detach()) -> f.detach().clone() (rẻ hơn nhiều).
-#   3. Vòng lặp gán prototype cho DPA (real) -> vector hóa bằng gather/index,
-#      giống cách proto_grids đã làm cho virtual domains.
-#   4. torch.eye(feat_dim) trong invert_batch -> cache làm buffer.
-#   5. Tránh .item() trong các loop nóng (giảm GPU-CPU sync).
-#  Logic thuật toán (CPCL, DPA, Domain Completion, ramp-up) giữ nguyên 100%.
 from collections import defaultdict
 
 import torch.optim as optim
@@ -46,11 +34,6 @@ def agg_func(protos):
     return protos
 
 
-# ============================================================================
-# Domain Operator - T_d(content) = W_d @ content + b_d
-# Dùng chung 1 operator cho CẢ prototype-level (forward) LẪN instance-level
-# (transform_batch/invert_batch) - đây là cơ chế nền cho Domain Completion.
-# ============================================================================
 class DomainOperator(nn.Module):
     def __init__(self, num_domains, feat_dim, rank=None):
         super().__init__()
@@ -71,19 +54,18 @@ class DomainOperator(nn.Module):
         self.b = nn.ParameterList([
             nn.Parameter(torch.zeros(feat_dim)) for _ in range(num_domains)
         ])
-        # [OPT] cache identity matrix thay vì tạo mới torch.eye() mỗi lần invert_batch được gọi
         self.register_buffer('_eye', torch.eye(feat_dim), persistent=False)
 
-    def get_W(self, domain_id):
-        if self.rank is None:
-            return self.W[domain_id]
-        return self.U[domain_id] @ self.V[domain_id].T
-    
     # def get_W(self, domain_id):
     #     if self.rank is None:
     #         return self.W[domain_id]
-    #     I = torch.eye(self.feat_dim, device=self.U[domain_id].device)
-    #     return I + self.U[domain_id] @ self.V[domain_id].T
+    #     return self.U[domain_id] @ self.V[domain_id].T
+    
+    def get_W(self, domain_id):
+        if self.rank is None:
+            return self.W[domain_id]
+        I = torch.eye(self.feat_dim, device=self.U[domain_id].device)
+        return I + self.U[domain_id] @ self.V[domain_id].T
 
     def transform_batch(self, content_batch, domain_id):
         W_d = self.get_W(domain_id)
@@ -160,9 +142,6 @@ class feddope(FederatedModel):
         self.domain_to_id = None
         self.current_epoch = 0
 
-        # [OPT] cache tensor hoá của global_protos, build 1 lần/round thay vì
-        # duyệt dict global_protos.items() hàng trăm lần mỗi batch (per-sample,
-        # per-virtual-domain) như bản gốc.
         self._proto_tensor_all = None   # (num_domains, num_classes, feat_dim)
         self._proto_valid_all = None    # (num_domains, num_classes)
         from utils.prototype_evolution import EvolutionManager
@@ -217,12 +196,6 @@ class feddope(FederatedModel):
 
         return agg_protos_label
 
-    # [OPT] ------------------------------------------------------------
-    # Build 1 tensor duy nhất chứa toàn bộ prototype hiện có, index theo
-    # (domain_id, class_id). Gọi 1 LẦN/round ngay sau khi global_protos được
-    # cập nhật (trong loc_update), thay vì để mỗi _train_net/mỗi batch/mỗi
-    # sample tự lặp lại dict global_protos.items().
-    # --------------------------------------------------------------------
     def _refresh_proto_cache(self):
         if len(self.global_protos) == 0:
             self._proto_tensor_all = None
@@ -241,14 +214,6 @@ class feddope(FederatedModel):
         self._proto_tensor_all = proto_tensor
         self._proto_valid_all = proto_valid
 
-    # [OPT] ------------------------------------------------------------
-    # Vector hoá hierarchical_info_loss_cross_domain + calculate_infonce.
-    # Tính InfoNCE cho CẢ BATCH cùng lúc bằng 1 phép matmul, thay vì loop
-    # per-sample + rebuild pos/neg list từ dict mỗi lần gọi.
-    # Trả về loss trung bình trên các sample có đủ pos+neg (giống hành vi gốc
-    # vốn cộng dồn rồi chia len(labels), chỉ khác là sample thiếu pos/neg sẽ
-    # góp 0 thay vì lỗi — hành vi an toàn hơn bản gốc).
-    # --------------------------------------------------------------------
     def hierarchical_info_loss_batch(self, f_batch, labels, exclude_domain_id):
         if self._proto_tensor_all is None:
             return torch.tensor(0.0, device=self.device)
@@ -339,9 +304,8 @@ class feddope(FederatedModel):
         criterion = nn.CrossEntropyLoss()
         criterion.to(self.device)
 
-        # Build proto_grids 1 LẦN/round (không phải mỗi batch) cho mọi domain khác.
         proto_grids = {}
-        own_proto_grid, own_proto_valid = None, None  # [OPT] thêm grid cho domain của chính client
+        own_proto_grid, own_proto_valid = None, None
         if len(self.global_protos) > 0:
             for d in range(self.num_domains):
                 if d != domain_id:
@@ -376,12 +340,8 @@ class feddope(FederatedModel):
                     loss_virtual_dpa = torch.tensor(0.0, device=self.device)
                     loss_identity_reg = torch.tensor(0.0, device=self.device)
                 else:
-                    # ---- CPCL: vector hóa toàn batch, thay cho loop per-sample ----
-                    # [OPT] thay: for i,label in enumerate(labels): loss += hierarchical_info_loss_cross_domain(...)
                     loss_InfoNCE = self.hierarchical_info_loss_batch(f, labels, exclude_domain_id=domain_id)
 
-                    # ---- DPA: vector hóa bằng gather, thay cho loop + deepcopy ----
-                    # [OPT] thay: proto_new = copy.deepcopy(f.detach()); for i,label in enumerate(labels): proto_new[i,:] = ...
                     f_detached = f.detach()
                     if own_proto_valid is not None and own_proto_valid.any():
                         own_targets = own_proto_grid[labels]          # (B, D)
@@ -392,7 +352,6 @@ class feddope(FederatedModel):
                     loss_intra_proto = 1 - F.cosine_similarity(
                         F.normalize(proto_new, dim=1), F.normalize(f, dim=1), dim=1).mean()
 
-                    # ---- Domain Completion: sinh virtual feature cho MỌI domain khác ----
                     virtual_feats = synthesize_all_domains(domain_operator, f, domain_id, self.num_domains)
 
                     loss_virtual_ce = torch.tensor(0.0, device=self.device)
@@ -401,16 +360,11 @@ class feddope(FederatedModel):
                     n_virtual = 0
 
                     for d, v_f in virtual_feats.items():
-                        # (a) CE - đã vector hóa từ bản gốc, giữ nguyên
                         outputs_virtual = net.classifier(v_f)
                         loss_virtual_ce = loss_virtual_ce + criterion(outputs_virtual, labels)
+                        
+                        loss_virtual_infonce = loss_virtual_infonce + self.hierarchical_info_loss_batch(v_f, labels, exclude_domain_id=d)
 
-                        # (b) CPCL/InfoNCE trên virtual feature - vector hóa toàn batch
-                        # [OPT] thay: for i,label in enumerate(labels): infonce += hierarchical_info_loss_cross_domain(...)
-                        loss_virtual_infonce = loss_virtual_infonce + self.hierarchical_info_loss_batch(
-                            v_f, labels, exclude_domain_id=d)
-
-                        # (c) DPA - đã vector hóa từ bản gốc (dùng grid[labels]), giữ nguyên
                         if d in proto_grids:
                             grid, valid = proto_grids[d]
                             targets = grid[labels]
@@ -426,7 +380,6 @@ class feddope(FederatedModel):
                         loss_virtual_infonce = loss_virtual_infonce / n_virtual
                         loss_virtual_dpa = loss_virtual_dpa / n_virtual
 
-                    # ---- Identity regularization - giữ nguyên như trước ----
                     loss_identity_reg = torch.tensor(0.0, device=self.device)
                     for d in range(self.num_domains):
                         if d != domain_id:

@@ -1,33 +1,3 @@
-"""
-prototype_evolution.py
-=======================
-Skeleton cho Federated Prototype Evolution (FPE) — Phase 1-3
-(Reliability-weighted aggregation, Prototype dynamics, Adaptive birth/merge).
-
-Thiết kế để CẮM VÀO codebase FedDOPE hiện có mà KHÔNG cần sửa DomainOperator,
-DPA loss, CPCL loss, hay training loop trong `_train_net`. Điểm tích hợp duy
-nhất là thay `proto_aggregation_attn(...)` bằng `EvolutionManager.step(...)`
-trong `loc_update`.
-
-Đã implement (Phase 1-3):
-    - Prototype như living object (mu, n, reliability, velocity, variance, age, history)
-    - Reliability = f(Agreement, Support, Temporal stability)   [Quality/Novelty: TODO]
-    - Reliability-aware update:  mu_{t+1} = mu_t + lr * R * (new_mu - mu_t)
-    - Matching local -> global prototype bằng cosine (đơn giản hoá vì
-      class/domain đã biết từ nhãn; chỉ cần phân biệt multi-mode trong 1 (class,domain))
-    - Adaptive birth với consensus (>= N client, >= T round) để tránh noise birth
-    - Adaptive merge dựa trên similarity + reliability (không chỉ similarity)
-    - Genealogy log (ai birth từ ai, ai merge với ai) để phục vụ paper/debug
-
-Chưa implement (để riêng, theo đúng lộ trình 4-phase đã thống nhất):
-    - Split (cần client-side k=2 clustering trên local samples, không chỉ
-      covariance thô từ server — xem thảo luận trước khi implement)
-    - Quality (Q) và Novelty (N) trong reliability formula (cần per-sample
-      confidence và cross-prototype comparison, để Phase 2+)
-    - Full semantic + temporal genealogy graph (hiện tại chỉ có genealogy_log
-      dạng list sự kiện, đủ để dựng graph sau này nhưng chưa có visualization)
-"""
-
 import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -37,9 +7,6 @@ import torch
 import torch.nn.functional as F
 
 
-# ============================================================================
-# 1. Prototype — living object thay vì tensor tĩnh
-# ============================================================================
 class Prototype:
     _id_counter = 0
 
@@ -70,8 +37,6 @@ class Prototype:
 
     @torch.no_grad()
     def _angular_distance(self, new_mu: torch.Tensor) -> float:
-        # Embedding trong FedDOPE  thường sống gần hypersphere (cosine-based loss)
-        # -> dùng angular distance thay vì ||mu_t - mu_{t-1}||_2 cho velocity/temporal.
         a = F.normalize(self.mu.unsqueeze(0), dim=1)
         b = F.normalize(new_mu.detach().unsqueeze(0), dim=1)
         cos = (a @ b.T).clamp(-1 + 1e-6, 1 - 1e-6)
@@ -81,12 +46,6 @@ class Prototype:
     def apply_update(self, new_mu: torch.Tensor, n_contrib: int,
                       variance: float, reliability: float, round_idx: int,
                       lr: float = 1.0):
-        """
-        Reliability-aware update (mục 16 trong thiết kế gốc):
-            mu_{t+1} = mu_t + lr * R * (new_mu - mu_t)
-        R thấp  -> gần như không update (bảo toàn, tránh noise).
-        R cao   -> update mạnh (tin tưởng evidence mới).
-        """
         self.velocity = self._angular_distance(new_mu)
         delta = new_mu.detach() - self.mu
         self.mu = self.mu + lr * reliability * delta
@@ -97,7 +56,6 @@ class Prototype:
         self.history.append(self.mu.clone())
 
     def temporal_stability(self) -> Optional[float]:
-        """T_i = exp(-angular_dist(mu_t, mu_{t-1})). None nếu chưa đủ history."""
         if len(self.history) < 2:
             return None
         prev, cur = self.history[-2], self.history[-1]
@@ -115,19 +73,7 @@ class Prototype:
                     parents=self.parents, children=self.children, alive=self.alive)
 
 
-# ============================================================================
-# 2. Reliability Estimator
-# ============================================================================
 class ReliabilityEstimator:
-    """
-    R_i = w_A * Agreement + w_S * Support + w_T * Temporal
-    (Quality và Novelty để trống — cần per-sample confidence / cross-proto
-    comparison, thêm ở Phase 2+ khi đã có evidence rằng 3 thành phần này đủ.)
-
-    Dùng additive (không multiplicative) để tránh collapse về 0 khi 1 thành
-    phần thấp do prototype còn non tuổi (xem thảo luận trước khi implement).
-    """
-
     def __init__(self, w_agreement: float = 0.4, w_support: float = 0.2,
                  w_temporal: float = 0.4, support_full_at: int = 5,
                  temporal_default: float = 0.5):
@@ -171,22 +117,7 @@ class _BirthCandidate:
     rounds_seen: int
     last_round: int
 
-
-# ============================================================================
-# 3. Evolution Manager — server-side orchestrator
-# ============================================================================
 class EvolutionManager:
-    """
-    Thay thế `proto_aggregation_attn` trong feddope.py. Nhận local_protos của
-    mọi client trong 1 round, trả về global_protos tương thích ngược với
-    pipeline hiện có (dict {(class_id, domain_label): tensor}).
-
-    Vì class/domain đã biết từ nhãn (supervised FL), "matching" ở đây chỉ cần
-    phân biệt multi-mode TRONG CÙNG 1 (class, domain) key — không cần cost
-    matrix 4 thành phần (semantic/domain/temporal/uncertainty) như bản thiết
-    kế tổng quát ban đầu. Đơn giản hoá này an toàn vì domain/class label loại
-    bỏ phần lớn ambiguity mà cost matrix đó nhắm tới.
-    """
 
     def __init__(self,
                  match_similarity_threshold: float = 0.7,
@@ -208,26 +139,13 @@ class EvolutionManager:
         self.update_lr = update_lr
         self.reliability = reliability_estimator or ReliabilityEstimator()
 
-        # key -> List[Prototype]  (hỗ trợ multi-prototype/mode mỗi class-domain
-        # một khi birth kích hoạt; Phase 1 thường chỉ có 1 prototype/key)
         self.registry: Dict[Tuple, List[Prototype]] = defaultdict(list)
         self.pending_births: Dict[Tuple, List[_BirthCandidate]] = defaultdict(list)
         self.genealogy_log: List[dict] = []
         self.round_idx = 0
 
-    # ------------------------------------------------------------------
-    # Entry point chính, gọi thay cho proto_aggregation_attn(...)
-    # ------------------------------------------------------------------
     def step(self, local_protos_by_client: Dict[int, Dict[Tuple, torch.Tensor]]
               ) -> Dict[Tuple, torch.Tensor]:
-        """
-        local_protos_by_client: {client_id: {(class_id, domain_label): proto_tensor}}
-        (đúng format hiện có của `self.local_protos` trong feddope.py)
-
-        Return: {(class_id, domain_label): tensor} — dominant prototype mỗi
-        key (reliability cao nhất), tương thích ngược 100% với
-        build_domain_proto_grid / _refresh_proto_cache hiện tại.
-        """
         self.round_idx += 1
         total_clients = len(local_protos_by_client)
 
@@ -244,9 +162,6 @@ class EvolutionManager:
 
         return self._export_dominant()
 
-    # ------------------------------------------------------------------
-    # Matching + reliability-aware update cho prototype đã tồn tại
-    # ------------------------------------------------------------------
     def _match_and_update(self, key, contributions, total_clients):
         existing = [p for p in self.registry[key] if p.alive]
 
@@ -278,10 +193,6 @@ class EvolutionManager:
         if unmatched:
             self._register_birth_candidates(key, unmatched)
 
-    # ------------------------------------------------------------------
-    # Adaptive birth: tránh 1 client tự tạo prototype -> cần consensus
-    # (>= birth_min_clients client, >= birth_min_rounds round persistence)
-    # ------------------------------------------------------------------
     def _register_birth_candidates(self, key, contributions):
         candidates = self.pending_births[key]
         for client_id, vec in contributions:
@@ -322,12 +233,8 @@ class EvolutionManager:
                     continue  # promoted -> loại khỏi pending
                 if cand.last_round == self.round_idx:
                     survivors.append(cand)
-                # candidate không xuất hiện round này -> để nó rơi rụng tự nhiên
             self.pending_births[key] = survivors
 
-    # ------------------------------------------------------------------
-    # Adaptive merge: similarity cao KHÔNG đủ, cần cả hai bên reliable
-    # ------------------------------------------------------------------
     def _process_merges(self):
         for key in list(self.registry.keys()):
             protos = [p for p in self.registry[key] if p.alive]
@@ -367,26 +274,11 @@ class EvolutionManager:
         self._log_event('merge', merged.id, parents=[p_a.id, p_b.id])
         return merged
 
-    # ------------------------------------------------------------------
-    # TODO Phase 4 — Split (client-side k=2 clustering, KHÔNG dùng covariance
-    # thô từ server vì không phát hiện đúng bimodality — xem thảo luận).
-    # def _process_splits(self, per_client_sample_stats): ...
-    # ------------------------------------------------------------------
-
     def _log_event(self, event_type: str, proto_id: int, **kwargs):
         self.genealogy_log.append(dict(round=self.round_idx, event=event_type,
                                         proto_id=proto_id, **kwargs))
 
-    # ------------------------------------------------------------------
-    # Export cho pipeline FedDOPE hiện tại
-    # ------------------------------------------------------------------
     def _export_dominant(self) -> Dict[Tuple, torch.Tensor]:
-        """
-        DPA/CPCL/build_domain_proto_grid hiện giả định 1 prototype mỗi
-        (class, domain). Chọn prototype reliability cao nhất làm "dominant"
-        để KHÔNG phá vỡ pipeline hiện có. Dùng export_all() nếu sau này sửa
-        DPA/CPCL để lặp qua nhiều prototype mỗi key.
-        """
         out = {}
         for key, protos in self.registry.items():
             alive = [p for p in protos if p.alive]
@@ -401,39 +293,5 @@ class EvolutionManager:
                 for key, protos in self.registry.items()}
 
     def snapshot(self) -> Dict[Tuple, List[dict]]:
-        """Dùng để log/debug/paper figure: state đầy đủ mọi prototype sống."""
         return {key: [p.to_dict() for p in protos if p.alive]
                 for key, protos in self.registry.items()}
-
-
-# ============================================================================
-# 4. Ghi chú tích hợp vào feddope.py (KHÔNG cần sửa DomainOperator/DPA/CPCL)
-# ============================================================================
-"""
-Trong feddope.__init__:
-
-    from utils.prototype_evolution import EvolutionManager
-    self.evolution_manager = EvolutionManager(
-        match_similarity_threshold=0.7,
-        birth_min_clients=2,
-        birth_min_rounds=2,
-        merge_sim_threshold=0.97,
-    )
-
-Trong feddope.loc_update, thay dòng:
-
-    self.global_protos = self.proto_aggregation_attn(self.local_protos, temperature=self.args.T)
-
-bằng:
-
-    self.global_protos = self.evolution_manager.step(self.local_protos)
-
-_refresh_proto_cache() và build_domain_proto_grid() KHÔNG cần sửa gì, vì
-global_protos vẫn có dạng {(class_id, domain_label): tensor} như trước
-(export_dominant() đảm bảo tương thích ngược).
-
-Muốn log genealogy mỗi round (phục vụ paper figure), thêm cuối loc_update:
-
-    if epoch % 10 == 0:
-        print(self.evolution_manager.genealogy_log[-5:])
-"""
